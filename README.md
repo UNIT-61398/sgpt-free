@@ -3,7 +3,7 @@
 > Run the **original, unmodified ShellGPT** (`sgpt`) in your terminal with **any model OpenCode supports** — including OpenCode's built-in free models and OpenRouter's free models — through a small local adapter. **No video needed:** everything is explained and commanded on this page.
 
 **Current version: v4.3.4 (2026-10-24).**
-Package: `sgpt-opencode-adapter-fixed-v4.3.4.zip`
+Package: `sgpt-free-opencode-adapter-v4.3.4.zip`
 SHA-256: `7f8e5df6df5305c394b1fee1bbfec23d8ebb70113e29ac846ea3a841294ee560`
 
 **The one rule you must know first:** this package ships **no default model**. Nobody chooses a model for you. You set it yourself (Section 7), and until you do, every request fails with a clear message telling you exactly what to run. That is deliberate, not a bug.
@@ -91,7 +91,7 @@ If you already have Kali Linux (or any Linux/macOS) with internet, this is the w
 
 ```bash
 # 1. Unpack the package
-unzip -o sgpt-opencode-adapter-fixed-v4.3.4.zip -d sgpt-v4.3.4
+unzip -o sgpt-free-opencode-adapter-v4.3.4.zip -d sgpt-v4.3.4
 cd sgpt-v4.3.4
 
 # 2. Install (fresh machine). With a model argument, that model is set for you.
@@ -141,7 +141,7 @@ No Node.js, no Docker, no database. If `pip` gives you an `externally-managed-en
 ### Fresh install
 
 ```bash
-unzip -o sgpt-opencode-adapter-fixed-v4.3.4.zip -d sgpt-v4.3.4
+unzip -o sgpt-free-opencode-adapter-v4.3.4.zip -d sgpt-v4.3.4
 cd sgpt-v4.3.4
 chmod +x install-kali.sh
 
