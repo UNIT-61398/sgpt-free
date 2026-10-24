@@ -1,0 +1,23 @@
+# ~/.config/shell_gpt/.sgptrc — sgpt pointed at the local adapter.
+# THERE IS NO DEFAULT MODEL IN THIS PACKAGE (v4.3.3+).
+# Set your own model first, or every request fails with a clear
+# "No model configured" message instead of silently using a default.
+#
+#   nano ~/.config/shell_gpt/.sgptrc
+#
+# Then set DEFAULT_MODEL to the EXACT id from 'opencode models'
+# (format: provider/model-id), for example:
+#   DEFAULT_MODEL=opencode/beam-free
+#   DEFAULT_MODEL=openrouter/recursive/flint-v1.0:free
+#   DEFAULT_MODEL=groq/llama-3.1-8b-instant
+#   DEFAULT_MODEL=google/gemini-3.8-flash
+# See README.md section 8 for every provider: where the free model
+# names come from and how to write them.
+# Start the adapter first (start-adapter.sh or the sgpt-free launcher).
+OPENAI_API_KEY=dummy-local
+API_BASE_URL=http://127.0.0.1:8642/v1
+DEFAULT_MODEL=SET_YOUR_MODEL_HERE
+OPENAI_USE_FUNCTIONS=false
+USE_LITELLM=false
+REQUEST_TIMEOUT=600
+DISABLE_STREAMING=false

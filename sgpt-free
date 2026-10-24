@@ -1,0 +1,20 @@
+#!/bin/sh
+# sgpt-free — one command for sgpt on OpenCode free models.
+# Starts the local adapter if it is not running, then runs sgpt.
+# Adapter + sgpt must be installed first (see install-kali.sh).
+DIR="$HOME/.local/share/sgpt-opencode"
+export NO_PROXY="localhost,127.0.0.1"
+export no_proxy="localhost,127.0.0.1"
+
+if ! curl -s -m 2 http://127.0.0.1:8642/health >/dev/null 2>&1; then
+  echo "[sgpt-free] starting adapter..." >&2
+  nohup python3 "$DIR/adapter.py" >"$DIR/adapter.log" 2>&1 &
+  i=0
+  while [ $i -lt 20 ]; do
+    curl -s -m 2 http://127.0.0.1:8642/health >/dev/null 2>&1 && break
+    i=$((i + 1))
+    sleep 0.5
+  done
+fi
+
+exec sgpt "$@"
