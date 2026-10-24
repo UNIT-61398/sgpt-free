@@ -1,6 +1,6 @@
 # ShellGPT + OpenCode Free Models
 
-> Run the **original, unmodified ShellGPT** (`sgpt`) in your terminal with **any model OpenCode supports** — including OpenCode's built-in free models and OpenRouter's free models — through a small local adapter. **No video needed:** everything is explained and commanded on this page.
+> Run the **original, unmodified ShellGPT** (`sgpt`) in your terminal with **any model OpenCode supports** — including OpenCode's built-in free models and any provider in OpenCode — through a small local adapter. **No video needed:** everything is explained and commanded on this page.
 
 **First version: v4.3.4 (2026-10-24).**
 Package: `sgpt-free-opencode-adapter-v4.3.4.zip`
