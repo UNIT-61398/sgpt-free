@@ -7,7 +7,7 @@ export NO_PROXY="localhost,127.0.0.1"
 export no_proxy="localhost,127.0.0.1"
 
 if ! curl -s -m 2 http://127.0.0.1:8642/health >/dev/null 2>&1; then
-  echo "[sgpt-free] starting adapter..." >&2
+  echo "[sgpt-free] starting adapter by UNIT-61398..." >&2
   nohup python3 "$DIR/adapter.py" >"$DIR/adapter.log" 2>&1 &
   i=0
   while [ $i -lt 20 ]; do
