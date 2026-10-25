@@ -727,8 +727,6 @@ rm -rf ~/.opencode                        # OpenCode (optional)
 |------|---------|
 | `README.md` | main documentation (the in-package guide) |
 | `README-GitHub.md` | this file — the GitHub-facing guide (same version, written for a first-time reader) |
-| `MASTER-README-SGPT-OpenCode.md` | the long master guide (providers, direct-OpenAI mode, uninstall detail) |
-| `CHANGELOG.md` | what changed in each version |
 | `install-kali.sh` | one-click installer (Method A) |
 | `apply-flint-fix.sh` | safe upgrade for existing installs (backups + health verify; never touches your `DEFAULT_MODEL`) |
 | `adapter.py` | the local adapter (Python standard library only) |
@@ -736,8 +734,6 @@ rm -rf ~/.opencode                        # OpenCode (optional)
 | `sgpt-audit.sh` | full live feature audit (Section 11) |
 | `sgpt-free` | launcher that auto-starts the adapter, then runs original `sgpt` |
 | `sgptrc.example` | sgpt config template → `~/.config/shell_gpt/.sgptrc` (placeholder model — you set it) |
-| `start-adapter.sh` | manual adapter start (foreground) |
-| `setup-guide.md` | background notes: why Zen free models need OpenCode, alternative routes |
 
 ---
 
