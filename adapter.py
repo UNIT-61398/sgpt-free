@@ -968,7 +968,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(
-        f"sgpt adapter on http://127.0.0.1:{PORT}/v1 "
+        f"sgpt adapter by UNIT-61398 on http://127.0.0.1:{PORT}/v1 "
         f"(default model: {DEFAULT_MODEL or 'none configured - set DEFAULT_MODEL in .sgptrc or pass --model'}; OpenRouter direct for openrouter/*; "
         f"OpenCode CLI fallback for other models; sandbox: {SANDBOX})",
         flush=True,
