@@ -50,7 +50,9 @@ class AdapterRegressionTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with patch.object(adapter, "DEFAULT_MODEL", ""):
+            clean_cfg = {"backend": "opencode", "colab_url": "", "colab_model": "", "colab_api_key": "", "opencode_model": ""}
+            with patch.object(adapter, "DEFAULT_MODEL", ""), \
+                 patch.object(adapter, "load_runtime_config", return_value=clean_cfg):
                 with client_urlopen(f"http://127.0.0.1:{server.server_port}/health", timeout=3) as r:
                     self.assertIsNone(json.loads(r.read().decode())["default_model"])
                 body = json.dumps({"messages": [{"role": "user", "content": "hello"}],
@@ -367,6 +369,162 @@ class TestScaffoldingStrip(unittest.TestCase):
     def test_code_keeps_real_html(self):
         raw = "<div>\nhello\n</div>"
         self.assertEqual(adapter.strip_scaffolding(raw, "code"), raw)
+
+    def test_strip_thinking_blocks(self):
+        raw = "<think>\nLet me reason about this.\n</think>\n\necho HELLO_OK"
+        self.assertEqual(adapter.strip_scaffolding(raw, "shell"), "echo HELLO_OK")
+        self.assertEqual(adapter.strip_scaffolding(raw, "chat"), "echo HELLO_OK")
+
+
+class TestColabBackend(unittest.TestCase):
+    def test_normalize_base_url(self):
+        self.assertEqual(adapter.normalize_base_url("https://abc.ngrok-free.app/v1/"), "https://abc.ngrok-free.app")
+        self.assertEqual(adapter.normalize_base_url("abc.ngrok-free.app/v1/chat/completions"), "https://abc.ngrok-free.app")
+        self.assertEqual(adapter.normalize_base_url("http://127.0.0.1:11434/api/tags"), "http://127.0.0.1:11434")
+
+    def test_resolve_route_colab_and_prefixes(self):
+        colab_cfg = {"backend": "colab", "colab_url": "https://x.ngrok-free.app", "colab_model": "sgpt-ai"}
+        self.assertEqual(adapter.resolve_route("sgpt-ai", colab_cfg), ("colab", "sgpt-ai"))
+        self.assertEqual(adapter.resolve_route("qwen2.5-coder:7b", colab_cfg), ("colab", "qwen2.5-coder:7b"))
+        self.assertEqual(adapter.resolve_route("opencode/beam-free", colab_cfg), ("opencode", "opencode/beam-free"))
+        self.assertEqual(adapter.resolve_route("openrouter/x:free", colab_cfg), ("opencode", "openrouter/x:free"))
+
+        oc_cfg = {"backend": "opencode", "colab_url": "https://x.ngrok-free.app", "colab_model": "sgpt-ai"}
+        self.assertEqual(adapter.resolve_route("colab/qwen3:8b", oc_cfg), ("colab", "qwen3:8b"))
+        self.assertEqual(adapter.resolve_route("ollama/llama3.1:8b", oc_cfg), ("colab", "llama3.1:8b"))
+        self.assertEqual(adapter.resolve_route("beam-free", oc_cfg), ("opencode", "opencode/beam-free"))
+
+    def test_colab_sends_ngrok_header_and_sanitizes_shell(self):
+        captured = {}
+        fake_reply = {
+            "id": "chatcmpl-colab",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "sgpt-ai",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<think>checking command</think>\n```bash\nss -tulnp\n```",
+                },
+                "finish_reason": "stop",
+            }],
+        }
+
+        def fake_urlopen(req, timeout):
+            captured["url"] = req.full_url
+            captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+            captured["payload"] = json.loads(req.data.decode())
+            return FakeResponse(fake_reply)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), adapter.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            colab_cfg = {"backend": "colab", "colab_url": "https://demo.ngrok-free.app/v1", "colab_model": "sgpt-ai"}
+            with patch.object(adapter, "load_runtime_config", return_value=colab_cfg), \
+                 patch.object(adapter, "urlopen", side_effect=fake_urlopen):
+                body = json.dumps({
+                    "model": "sgpt-ai",
+                    "messages": [
+                        {"role": "system", "content": "You are a shell command generator. Ensure the output is a valid shell command."},
+                        {"role": "user", "content": "show listening ports"},
+                    ],
+                    "stream": False,
+                }).encode()
+                req = Request(f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                              data=body, headers={"Content-Type": "application/json"})
+                with client_urlopen(req, timeout=3) as r:
+                    res = json.loads(r.read().decode())
+            self.assertEqual(captured["url"], "https://demo.ngrok-free.app/v1/chat/completions")
+            self.assertEqual(captured["headers"].get("ngrok-skip-browser-warning"), "true")
+            self.assertEqual(res["choices"][0]["message"]["content"], "ss -tulnp")
+        finally:
+            server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+    def test_colab_tool_call_automatic_shim_fallback(self):
+        from urllib.error import HTTPError
+        calls = []
+
+        def fake_urlopen(req, timeout):
+            payload = json.loads(req.data.decode())
+            calls.append(payload)
+            if len(calls) == 1:
+                err_body = json.dumps({"error": {"message": "registry.ollama.ai/model does not support tools"}}).encode()
+                raise HTTPError(req.full_url, 400, "Bad Request", hdrs=None, fp=io.BytesIO(err_body))
+            return FakeResponse({
+                "id": "chatcmpl-shim",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"tool_call": {"name": "execute_shell", "arguments": {"command": "uname -a"}}}',
+                    },
+                    "finish_reason": "stop",
+                }],
+            })
+
+        colab_cfg = {"backend": "colab", "colab_url": "https://demo.ngrok-free.app", "colab_model": "gemma3:4b"}
+        with patch.object(adapter, "urlopen", side_effect=fake_urlopen):
+            res = adapter.run_colab("gemma3:4b", {
+                "messages": [{"role": "user", "content": "check kernel"}],
+                "tools": [{"type": "function", "function": {"name": "execute_shell", "description": "run", "parameters": {"type": "object"}}}],
+            }, colab_cfg)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("tools", calls[0])
+        self.assertNotIn("tools", calls[1])
+        self.assertEqual(res["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(res["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "execute_shell")
+
+
+class TestSgptFreeCLI(unittest.TestCase):
+    def test_cli_colab_opencode_set_model_and_help(self):
+        import importlib.machinery
+        import importlib.util
+        import shutil
+        cli_path = None
+        for cand in (
+            os.path.join(os.path.dirname(__file__), "sgpt-free"),
+            shutil.which("sgpt-free") or "",
+            os.path.expanduser("~/.local/bin/sgpt-free"),
+        ):
+            if cand and os.path.isfile(cand):
+                cli_path = cand
+                break
+        if not cli_path:
+            self.skipTest("sgpt-free executable not found")
+        loader = importlib.machinery.SourceFileLoader("sgpt_free_cli", cli_path)
+        spec = importlib.util.spec_from_loader("sgpt_free_cli", loader)
+        cli = importlib.util.module_from_spec(spec)
+        loader.exec_module(cli)
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg_dir = adapter.Path(td)
+            with patch.object(cli, "CFG_DIR", cfg_dir), \
+                 patch.object(cli, "SGPTRC", cfg_dir / ".sgptrc"), \
+                 patch.object(cli, "FREE_CFG", cfg_dir / "sgpt-free.json"), \
+                 patch.object(cli, "fetch_colab_models", return_value=["sgpt-ai"]), \
+                 patch.object(cli, "ensure_adapter", return_value=True):
+                self.assertEqual(cli.cmd_colab(["https://demo.ngrok-free.app"]), 0)
+                saved = cli.load_free_cfg()
+                self.assertEqual(saved["backend"], "colab")
+                self.assertEqual(saved["colab_url"], "https://demo.ngrok-free.app")
+                self.assertEqual(saved["colab_model"], "sgpt-ai")
+                self.assertEqual(cli.read_sgptrc()["DEFAULT_MODEL"], "sgpt-ai")
+
+                self.assertEqual(cli.cmd_set_model(["qwen3:8b"]), 0)
+                self.assertEqual(cli.read_sgptrc()["DEFAULT_MODEL"], "qwen3:8b")
+
+                self.assertEqual(cli.cmd_opencode(["opencode/beam-free"]), 0)
+                self.assertEqual(cli.load_free_cfg()["backend"], "opencode")
+                self.assertEqual(cli.read_sgptrc()["DEFAULT_MODEL"], "opencode/beam-free")
+
+                self.assertEqual(cli.cmd_functions(True), 0)
+                self.assertEqual(cli.read_sgptrc()["OPENAI_USE_FUNCTIONS"], "true")
+
+                # Help should work even without sgpt installed locally
+                with patch.object(cli.shutil, "which", return_value=None):
+                    self.assertEqual(cli.cmd_help(), 0)
 
 
 if __name__ == "__main__":

@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
-"""ShellGPT-compatible local adapter: every provider, every model.
+"""ShellGPT-compatible local adapter: Colab/Ollama + OpenCode/OpenRouter.
 
-Routing:
-- ``openrouter/*`` model IDs are called through OpenRouter's official
-  Chat Completions API (native roles, sampling parameters and tool
-  calls) when a credential can be read — from OPENROUTER_API_KEY,
-  OpenCode's auth.json (API-key or OAuth entry), OpenCode's config
-  (provider.openrouter apiKey), or OpenCode's credential database.
-  Secrets are never printed. If NO readable credential exists,
-  ``openrouter/*`` transparently uses the OpenCode CLI route below
-  instead of failing (that is how the v2 setup ran successfully).
-- Every other model ID (``opencode/*`` Zen free models, or any provider
-  connected in OpenCode — OpenAI, Anthropic, Google, ...) runs through
-  the official OpenCode CLI, so any model OpenCode can run works here.
+Supports two backends switchable at any time via `sgpt-free` / `sgpt-f`:
+1. ``colab`` (Google Colab + Ollama + ngrok, or any OpenAI-compatible /v1 URL):
+   - Sends requests directly to ``<colab_url>/v1/chat/completions`` with
+     ``ngrok-skip-browser-warning: true`` header.
+   - Supports native tool calling (``--functions``), and automatically falls
+     back to the JSON tool-call shim if the chosen Ollama model does not
+     support native tools.
+   - Strips ``<think>...</think>`` reasoning blocks and leaked scaffolding
+     before handing shell/code output to ShellGPT.
+2. ``opencode`` (OpenCode CLI + OpenRouter direct):
+   - ``openrouter/*`` model IDs call OpenRouter's Chat Completions API directly
+     when a readable credential is found (OPENROUTER_API_KEY, OpenCode
+     auth.json, config, or credential DB); otherwise transparently falls back
+     to ``opencode run``.
+   - Every other provider/model (``opencode/*`` Zen free models, etc.) runs
+     through ``opencode run``.
 
-Shell output is sanitized and code output is de-fenced before reaching
-ShellGPT on both routes. On the OpenCode fallback route, function
-calling uses a JSON shim (see _fallback_response); on OpenRouter it is
-native. The adapter only listens on loopback. ShellGPT remains
-responsible for its interactive [E/M/D/A] confirmation and execution.
+Explicit prefixes always work regardless of active backend:
+- ``colab/<model>`` or ``ollama/<model>`` -> routes to configured Colab URL.
+- ``openrouter/<model>`` -> routes to OpenRouter / OpenCode.
+- ``opencode/<model>`` -> routes to OpenCode CLI.
+
+The adapter listens on 127.0.0.1 only. ShellGPT remains responsible for its
+interactive [E/M/D/A] confirmation, execution, chats, REPL, roles, and cache.
 """
 from __future__ import annotations
 
@@ -27,36 +33,36 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 import uuid
-from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Semaphore
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 PORT = int(os.getenv("SGPT_OC_PORT", "8642"))
-# No shipped default model (v4.3.3): the user sets DEFAULT_MODEL in
-# ~/.config/shell_gpt/.sgptrc (or passes --model per command).
-# SGPT_OC_MODEL may still set an adapter-side default for advanced
-# setups, but the package itself ships with none: an unset or
-# placeholder model is refused with a clear message, never silently
-# replaced by a default.
 DEFAULT_MODEL = os.getenv("SGPT_OC_MODEL", "")
 MODEL_PLACEHOLDER = "SET_YOUR_MODEL_HERE"
 NO_MODEL_MESSAGE = (
-    "No model configured: set DEFAULT_MODEL in ~/.config/shell_gpt/.sgptrc "
-    "(run: nano ~/.config/shell_gpt/.sgptrc) to a real model id, e.g. "
-    "opencode/beam-free or openrouter/recursive/flint-v1.0:free, "
-    "or pass --model <provider/model-id> for one command."
+    "No model configured: run 'sgpt-free --setup' (or 'sgpt-free --colab <URL> <MODEL>' "
+    "or 'sgpt-free --set-model <MODEL>'), or set DEFAULT_MODEL in ~/.config/shell_gpt/.sgptrc "
+    "(run: nano ~/.config/shell_gpt/.sgptrc), or pass --model <model> for one command."
 )
 OPENCODE_BIN = os.getenv("SGPT_OC_BIN", os.path.expanduser("~/.opencode/bin/opencode"))
 TIMEOUT = int(os.getenv("SGPT_OC_TIMEOUT", "600"))
-SANDBOX = os.getenv("SGPT_OC_SANDBOX", "/tmp/sgpt-oc-sandbox")
+SANDBOX = os.getenv("SGPT_OC_SANDBOX", os.path.join(tempfile.gettempdir(), "sgpt-oc-sandbox"))
 OPENROUTER_URL = os.getenv("SGPT_OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
+CONFIG_PATH = Path(
+    os.getenv(
+        "SGPT_FREE_CONFIG",
+        os.path.join(os.path.expanduser("~/.config"), "shell_gpt", "sgpt-free.json"),
+    )
+)
 os.makedirs(SANDBOX, exist_ok=True)
 
-# Avoid stampeding a free model with concurrent requests.
+# Avoid stampeding a free model or single-GPU T4 server with concurrent requests.
 gate = Semaphore(1)
 
 FREE_MODELS = [
@@ -74,6 +80,81 @@ FREE_MODELS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Dynamic local configuration (~/.config/shell_gpt/sgpt-free.json)
+# ---------------------------------------------------------------------------
+
+def load_runtime_config() -> dict:
+    """Load backend config dynamically so changes take effect without restart."""
+    cfg = {
+        "backend": "opencode",
+        "colab_url": "",
+        "colab_model": "",
+        "colab_api_key": "",
+        "opencode_model": "",
+    }
+    try:
+        if CONFIG_PATH.exists():
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cfg.update({k: v for k, v in data.items() if v is not None})
+    except Exception:
+        pass
+    # Environment overrides (useful for scripting/testing)
+    if os.getenv("SGPT_BACKEND"):
+        cfg["backend"] = os.getenv("SGPT_BACKEND", "").strip().lower()
+    if os.getenv("SGPT_COLAB_URL"):
+        cfg["colab_url"] = os.getenv("SGPT_COLAB_URL", "").strip()
+    if os.getenv("SGPT_COLAB_MODEL"):
+        cfg["colab_model"] = os.getenv("SGPT_COLAB_MODEL", "").strip()
+    if os.getenv("SGPT_COLAB_API_KEY"):
+        cfg["colab_api_key"] = os.getenv("SGPT_COLAB_API_KEY", "").strip()
+    if cfg.get("backend") not in ("colab", "opencode"):
+        cfg["backend"] = "opencode"
+    return cfg
+
+
+def normalize_base_url(url: str) -> str:
+    """Normalize a Colab / Ollama / OpenAI-compatible base URL (without /v1)."""
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return ""
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    for suffix in ("/v1/chat/completions", "/v1/models", "/api/chat", "/api/tags", "/v1"):
+        if u.endswith(suffix):
+            u = u[: -len(suffix)].rstrip("/")
+    return u
+
+
+def resolve_route(requested: str | None, cfg: dict | None = None) -> tuple[str, str]:
+    """Return (route, model_id) where route is 'colab' or 'opencode'.
+
+    Explicit prefixes ('colab/', 'ollama/', 'openrouter/', 'opencode/') always
+    override the active backend; bare model names follow cfg['backend'].
+    """
+    cfg = cfg if cfg is not None else load_runtime_config()
+    active_backend = cfg.get("backend", "opencode")
+    raw = (requested or "").strip()
+
+    if raw.startswith(("colab/", "ollama/")):
+        model_name = raw.split("/", 1)[1].strip()
+        if not model_name:
+            raise RuntimeError(NO_MODEL_MESSAGE)
+        return "colab", model_name
+
+    if raw.startswith(("openrouter/", "opencode/")):
+        return "opencode", raw
+
+    if active_backend == "colab":
+        m = raw or cfg.get("colab_model", "").strip() or DEFAULT_MODEL.strip()
+        if not m or m == MODEL_PLACEHOLDER:
+            raise RuntimeError(NO_MODEL_MESSAGE)
+        return "colab", m
+
+    return "opencode", backend_model(requested)
+
+
 def backend_model(requested: str | None) -> str:
     m = (requested or DEFAULT_MODEL).strip()
     if not m or m == MODEL_PLACEHOLDER:
@@ -88,6 +169,10 @@ def backend_model(requested: str | None) -> str:
     return f"opencode/{m}"
 
 
+# ---------------------------------------------------------------------------
+# Message & output formatting / sanitization
+# ---------------------------------------------------------------------------
+
 def flatten_messages(messages: list[dict]) -> str:
     """Serialize messages for the CLI fallback without persona/jailbreak text."""
     parts: list[str] = []
@@ -99,8 +184,6 @@ def flatten_messages(messages: list[dict]) -> str:
                 str(p.get("text", "")) for p in content if isinstance(p, dict)
             )
         if not content and msg.get("tool_calls"):
-            # Assistant function-call turns carry no text; render the call
-            # so the model can see what already ran (fallback shim flow).
             rendered = []
             for call in msg.get("tool_calls") or []:
                 fn = (call or {}).get("function") or {}
@@ -113,10 +196,6 @@ def flatten_messages(messages: list[dict]) -> str:
     transcript = "\n\n".join(parts)
     shell_note = ""
     if output_mode(messages) == "shell":
-        # Observed live (Flint, CLI route): asked for "a command that prints
-        # X", the model answered "print X" - it copied the request's verb
-        # instead of producing the standard shell command. Clarify once,
-        # here, so real -s use benefits too, not just the audit.
         shell_note = (
             " The request describes what the command must do - it is not "
             "the command itself. Output exactly one valid bash/zsh command; "
@@ -161,28 +240,18 @@ def output_mode(messages: list[dict]) -> str:
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+_UNCLOSED_THINK_RE = re.compile(r"<think>.*$", re.DOTALL | re.IGNORECASE)
 _FENCED_BLOCK_RE = re.compile(r"```(?:[A-Za-z0-9_+.-]+)?[ \t]*\n?(.*?)```", re.DOTALL)
 _INLINE_CODE_LINE_RE = re.compile(r"^[ \t]*`([^`\n]+)`[ \t]*$", re.MULTILINE)
 _META_LINE_RE = re.compile(
     r"^\s*(?:wait\s*[—-]|so the final answer\b|the final answer\b|"
-    r"explanation\s*:|reasoning\s*:|analysis\s*:|note\s*:)", re.IGNORECASE
+    r"explanation\s*:|reasoning\s*:|analysis\s*:|note\s*:)",
+    re.IGNORECASE,
 )
 
-
-# Agent-harness scaffolding: agent backends (e.g. the OpenCode agent on
-# the CLI route) sometimes leak XML-style fragments of their internal
-# tool-call serialization into the final answer, e.g. a stray
-# </rfl:parameter> line after the real command. In shell mode that line
-# is EXECUTED, and the shell dies with "parse error near '>'" (zsh
-# reports it at line 2 of the executed text). The leak sits in the
-# backend reply, not in any sgpt switch, so it can surface in -s, -c,
-# -d, or chat alike - the strip below therefore runs for every mode.
 _TAG_NAME = r"[A-Za-z][A-Za-z0-9_:\-\.]*"
 _STANDALONE_TAG_RE = re.compile(rf"^\s*</?{_TAG_NAME}(\s+[^<>]*)?>\s*$")
-# Tag names that are harness vocabulary, never document content. A bare
-# line with one of these (optionally namespaced, e.g. </rfl:parameter>)
-# is scaffolding in every mode. Generic element names (div, result,
-# content, ...) are NOT in this list, so real HTML/XML keeps working.
 _HARNESS_TAG_NAMES = (
     "rfl", "parameter", "tool_call", "toolcall", "function_call",
     "function", "invocation", "tool", "response",
@@ -194,20 +263,27 @@ _HARNESS_TAG_RE = re.compile(
 _TRAILING_CLOSING_TAG_RE = re.compile(r"\s*</[A-Za-z][A-Za-z0-9_:\-\.]*>\s*$")
 
 
-def strip_scaffolding(text: str, mode: str = "chat") -> str:
-    """Remove leaked agent-harness scaffolding lines from a model reply.
+def strip_thinking(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks emitted by reasoning models."""
+    if not text or "<think>" not in text.lower():
+        return text or ""
+    cleaned = _THINK_BLOCK_RE.sub("", text).strip()
+    if not cleaned:
+        # Model put everything inside <think>; keep inner text rather than empty
+        return re.sub(r"</?think>", "", text, flags=re.IGNORECASE).strip()
+    # Handle truncated unclosed <think> if there is text before it
+    if "<think>" in cleaned.lower():
+        without_tail = _UNCLOSED_THINK_RE.sub("", cleaned).strip()
+        if without_tail:
+            return without_tail
+    return cleaned
 
-    Rules, deliberately conservative:
-    - A line that is exactly one harness tag is removed in every mode.
-    - Any other standalone tag line is removed only in shell mode, where
-      such a line can never be a valid command (code mode keeps real
-      HTML/XML, chat mode keeps everything except harness tags).
-    - A closing tag glued to the end of a shell command is cut off.
-    Legitimate shell redirections (echo hi > out.txt, cat < in.txt)
-    are untouched: they are not standalone tag lines.
-    """
+
+def strip_scaffolding(text: str, mode: str = "chat") -> str:
+    """Remove leaked agent-harness scaffolding lines from a model reply."""
+    text = strip_thinking(text or "")
     lines = []
-    for line in (text or "").splitlines():
+    for line in text.splitlines():
         if _HARNESS_TAG_RE.match(line):
             continue
         if mode == "shell" and _STANDALONE_TAG_RE.match(line):
@@ -257,13 +333,7 @@ def sanitize_shell_output(raw: str) -> str:
 
 
 def sanitize_code_output(raw: str) -> str:
-    """Return only code for ShellGPT's -c role.
-
-    The role asks for plain code without markdown fences, but models often
-    wrap code in ``` fences anyway (which would end up inside the user's
-    file/terminal). If the reply contains a fenced block, return the first
-    block's content; otherwise return the reply trimmed, unchanged.
-    """
+    """Return only code for ShellGPT's -c role."""
     text = _ANSI_RE.sub("", (raw or "")).replace("\r\n", "\n").strip()
     if not text:
         raise ValueError("Model returned empty code output.")
@@ -327,10 +397,59 @@ def parse_tool_call(text: str, allowed: set) -> tuple | None:
     return None
 
 
+def _tool_shim_instruction(tools: list[dict]) -> str:
+    brief = "\n".join(
+        f"- {t['name']}: {t['description']} "
+        f"Parameters (JSON schema): {json.dumps(t['parameters'])}"
+        for t in tools
+    )
+    return (
+        "\n\nFunctions you may call (at most one per reply), provided "
+        "by the person's own terminal program:\n" + brief + "\n"
+        "To call one, reply with ONLY this JSON object and nothing "
+        "else:\n"
+        '{"tool_call": {"name": "<function name>", '
+        '"arguments": {<arguments>}}}\n'
+        "If no function is needed, answer in plain text as usual."
+    )
+
+
+def _make_tool_call_response(model: str, name: str, args: dict) -> dict:
+    return {
+        "id": "chatcmpl-" + uuid.uuid4().hex[:24],
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_" + uuid.uuid4().hex[:24],
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args),
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter credential discovery
+# ---------------------------------------------------------------------------
+
 def _data_dirs() -> list[Path]:
-    dirs = [Path(os.getenv("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))),
-            Path.home() / ".local" / "share",
-            Path.home() / ".config"]
+    dirs = [
+        Path(os.getenv("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))),
+        Path.home() / ".local" / "share",
+        Path.home() / ".config",
+    ]
     out: list[Path] = []
     for d in dirs:
         if d not in out:
@@ -339,8 +458,10 @@ def _data_dirs() -> list[Path]:
 
 
 def _config_dirs() -> list[Path]:
-    dirs = [Path(os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config"))),
-            Path.home() / ".config"]
+    dirs = [
+        Path(os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config"))),
+        Path.home() / ".config",
+    ]
     out: list[Path] = []
     for d in dirs:
         if d not in out:
@@ -351,14 +472,13 @@ def _config_dirs() -> list[Path]:
 def _load_json_tolerant(path: Path):
     """Parse JSON or JSONC (// and /* */ comments, trailing commas)."""
     try:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
     except OSError:
         return None
     try:
         return json.loads(text)
     except Exception:
         pass
-    # String-aware comment stripper (does not touch // inside strings).
     out: list[str] = []
     i, n = 0, len(text)
     in_str = False
@@ -400,18 +520,12 @@ def _load_json_tolerant(path: Path):
 
 
 def _key_from_auth_entry(entry) -> str | None:
-    """Extract a usable credential from one provider's auth.json entry.
-
-    OpenCode auth entries are {"type": "api", "key": ...} or
-    {"type": "oauth", "access": ..., "refresh": ..., "expires": <ms>}.
-    """
     if not isinstance(entry, dict):
         return None
     for field in ("key", "apiKey", "api_key"):
         value = entry.get(field)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    # Any OpenRouter-shaped key stored under an unexpected field name.
     for value in entry.values():
         if isinstance(value, str) and value.strip().startswith("sk-or-"):
             return value.strip()
@@ -422,7 +536,6 @@ def _key_from_auth_entry(entry) -> str | None:
             expires = float(expires)
         except (TypeError, ValueError):
             expires = 0
-        # expires is milliseconds since epoch in OpenCode's schema.
         if isinstance(access, str) and access.strip() and (
             not expires or expires > time.time() * 1000
         ):
@@ -451,7 +564,6 @@ def _key_from_auth_files() -> str | None:
 
 
 def _resolve_config_value(value):
-    """Resolve OpenCode config substitutions like {env:VAR} / {file:path}."""
     if not isinstance(value, str):
         return None
     value = value.strip()
@@ -461,7 +573,7 @@ def _resolve_config_value(value):
     m = re.fullmatch(r"\{file:([^}]+)\}", value)
     if m:
         try:
-            return Path(m.group(1)).expanduser().read_text().strip() or None
+            return Path(m.group(1)).expanduser().read_text(encoding="utf-8").strip() or None
         except OSError:
             return None
     return value or None
@@ -486,12 +598,6 @@ def _key_from_opencode_config() -> str | None:
 
 
 def _key_from_opencode_db() -> str | None:
-    """Newer OpenCode builds keep credentials in opencode.db (SQLite).
-
-    Read-only and fully guarded: any schema mismatch just means
-    "not found here". Only OpenRouter-labelled rows are considered,
-    and the value itself is never logged.
-    """
     try:
         import sqlite3
     except Exception:
@@ -531,8 +637,6 @@ def _key_from_opencode_db() -> str | None:
                                 exp = float(expiry or 0)
                             except (TypeError, ValueError):
                                 exp = 0
-                            # expiry may be seconds or ms; accept if not
-                            # clearly past under either scale.
                             if not exp or exp > now_ms or exp > time.time():
                                 return token.strip()
             finally:
@@ -547,7 +651,6 @@ _OR_FALLBACK_NOTED = False
 
 
 def _find_openrouter_key() -> tuple:
-    """Return (key, source-label) or (None, None). Never logs the key."""
     if _KEY_CACHE["key"]:
         return _KEY_CACHE["key"], "cache"
     env_key = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -579,22 +682,15 @@ def _openrouter_api_key() -> str:
     )
 
 
-# Fields supported by OpenRouter's OpenAI-compatible chat completions endpoint.
-_OPENROUTER_PARAMETERS = (
+_OPENAI_PARAMETERS = (
     "temperature", "top_p", "max_tokens", "max_completion_tokens", "stop",
     "presence_penalty", "frequency_penalty", "repetition_penalty", "top_k",
     "min_p", "seed", "n", "logit_bias", "response_format", "tools",
     "tool_choice", "parallel_tool_calls", "functions", "function_call", "user",
 )
 
-
 # ---------------------------------------------------------------------------
 # Provider limit reporting
-#
-# When a free model's quota/rate limit is exhausted - or a paid model's
-# limit/credit runs out - the user should SEE that clearly instead of a raw
-# provider error or a hang. Both routes map those failures onto one of two
-# explicit messages.
 # ---------------------------------------------------------------------------
 
 LIMIT_MARKERS = (
@@ -621,14 +717,14 @@ def _looks_like_limit(text: str) -> bool:
 
 
 def limit_message(model: str, detail: str = "") -> str:
-    """Clear user-facing message when a provider limit is hit."""
     detail = (detail or "").strip()
     suffix = f" Provider said: {detail[:300]}" if detail else ""
     if _is_free_model(model):
         return (
             f"FREE LIMIT HIT: the free quota / rate limit for model '{model}' "
             "is exhausted. Wait a few minutes and try again, or switch to "
-            "another model, e.g. sgpt --model <provider/model> \"...\"."
+            "another model (sgpt-free --set-model <model>) or switch to Colab "
+            "(sgpt-free --colab <URL> <MODEL>)."
             f"{suffix}"
         )
     return (
@@ -639,26 +735,250 @@ def limit_message(model: str, detail: str = "") -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Backend 1: Colab / Ollama (OpenAI-compatible /v1 API)
+# ---------------------------------------------------------------------------
+
+def _colab_headers(api_key: str = "") -> dict[str, str]:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "ngrok-skip-browser-warning": "true",
+        "User-Agent": "sgpt-free-adapter/5.0",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _post_colab(endpoint: str, payload: dict, api_key: str = "") -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    request = Request(endpoint, data=data, headers=_colab_headers(api_key), method="POST")
+    # Do not hold the global OpenCode semaphore here: if a user Ctrl+C's a
+    # slow request or had a stale ngrok URL, the next request must not hang.
+    with urlopen(request, timeout=TIMEOUT) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+        return json.loads(raw)
+
+
+def _normalize_colab_message(response: dict) -> dict:
+    """If a thinking model put its reply in reasoning/reasoning_content with empty content, surface it."""
+    choices = response.get("choices") or []
+    if choices:
+        msg = choices[0].get("message") or {}
+        content = msg.get("content")
+        if not (isinstance(content, str) and content.strip()):
+            fallback = msg.get("reasoning_content") or msg.get("reasoning") or ""
+            if isinstance(fallback, str) and fallback.strip() and not msg.get("tool_calls"):
+                msg["content"] = fallback
+                choices[0]["message"] = msg
+    return response
+
+
+def _extract_http_error_message(exc: HTTPError) -> str:
+    try:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            details = json.loads(raw)
+            err = details.get("error", {})
+            if isinstance(err, dict):
+                return str(err.get("message") or err.get("code") or raw[:300])
+            return str(err or details.get("message") or raw[:300])
+        except Exception:
+            return raw[:300] or f"HTTP {exc.code}"
+    except Exception:
+        return f"HTTP {exc.code}"
+
+
+def _prepare_messages_for_shim(messages: list[dict], tools: list[dict]) -> list[dict]:
+    """Convert tool-role messages + append tool shim instructions for models without native tools."""
+    converted: list[dict] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = _message_text(msg)
+        if role == "tool":
+            converted.append({
+                "role": "user",
+                "content": f"[Function result]: {content}",
+            })
+        elif role == "assistant" and not content and msg.get("tool_calls"):
+            rendered = []
+            for call in msg.get("tool_calls") or []:
+                fn = (call or {}).get("function") or {}
+                rendered.append(
+                    f"[called function {fn.get('name', '?')} "
+                    f"with arguments {fn.get('arguments', '{}')}]"
+                )
+            converted.append({"role": "assistant", "content": "\n".join(rendered)})
+        else:
+            converted.append({"role": role, "content": content})
+
+    shim = _tool_shim_instruction(tools)
+    if converted and converted[0].get("role") == "system":
+        converted[0] = {
+            "role": "system",
+            "content": converted[0]["content"] + shim,
+        }
+    else:
+        converted.insert(0, {"role": "system", "content": shim.strip()})
+    return converted
+
+
+def run_colab(model: str, req: dict, cfg: dict) -> dict:
+    """Call the Google Colab / Ollama OpenAI-compatible /v1/chat/completions endpoint."""
+    base_url = normalize_base_url(cfg.get("colab_url", ""))
+    if not base_url:
+        raise RuntimeError(
+            "Colab backend is active, but no Colab URL is set. "
+            "Run: sgpt-free --colab <NGROK_URL> <MODEL>"
+        )
+    endpoint = f"{base_url}/v1/chat/completions"
+    api_key = (cfg.get("colab_api_key") or "").strip()
+    messages = req.get("messages", [])
+    tools = extract_tools(req)
+
+    payload: dict = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }
+    for key in _OPENAI_PARAMETERS:
+        if key in req and req[key] is not None:
+            payload[key] = req[key]
+
+    # Disable slow chain-of-thought thinking for shell (-s) and code (-c)
+    # on Ollama thinking models (qwen3/qwen3.5/gemma4) so commands/code return
+    # in seconds instead of waiting 30-90s for hidden reasoning tokens.
+    mode = output_mode(messages)
+    think_env = os.getenv("SGPT_COLAB_THINK", "").strip().lower()
+    if mode in ("shell", "code") and think_env != "true" and "reasoning_effort" not in payload:
+        payload["reasoning_effort"] = "none"
+
+    try:
+        result = _post_colab(endpoint, payload, api_key)
+    except HTTPError as exc:
+        msg = _extract_http_error_message(exc)
+        low = msg.lower()
+        # If an OpenAI-compatible server rejects reasoning_effort, retry without it
+        if exc.code == 400 and "reasoning_effort" in payload and "reasoning" in low:
+            payload.pop("reasoning_effort", None)
+            result = _post_colab(endpoint, payload, api_key)
+            return _normalize_colab_message(result)
+        # Automatic fallback: if the Ollama model doesn't support native tools,
+        # retry with our JSON tool-call shim so `sgpt-free --functions` still works!
+        if exc.code == 400 and tools and ("tool" in low or "function" in low):
+            shim_payload = {
+                "model": model,
+                "messages": _prepare_messages_for_shim(messages, tools),
+                "stream": False,
+            }
+            for key in ("temperature", "top_p", "max_tokens", "stop", "seed"):
+                if key in req and req[key] is not None:
+                    shim_payload[key] = req[key]
+            try:
+                result = _post_colab(endpoint, shim_payload, api_key)
+            except HTTPError as exc2:
+                msg2 = _extract_http_error_message(exc2)
+                raise RuntimeError(f"Colab/Ollama HTTP {exc2.code}: {msg2[:500]}") from None
+            except URLError as exc2:
+                raise RuntimeError(
+                    f"Colab/Ollama connection failed ({base_url}): {exc2.reason}. "
+                    "Is your Colab cell still running?"
+                ) from None
+            except TimeoutError:
+                raise RuntimeError(f"Colab/Ollama request timed out after {TIMEOUT}s") from None
+            # Translate JSON shim reply into native OpenAI tool_calls response
+            choices = result.get("choices") or []
+            if choices:
+                text = strip_thinking(((choices[0].get("message") or {}).get("content")) or "")
+                parsed = parse_tool_call(text, {t["name"] for t in tools})
+                if parsed is not None:
+                    return _make_tool_call_response(model, parsed[0], parsed[1])
+            return result
+
+        if exc.code == 404:
+            if "ngrok" in low or "tunnel" in low or "not found" in low:
+                raise RuntimeError(
+                    f"Colab/Ollama HTTP 404 ({msg[:300]}). "
+                    "Either the ngrok tunnel expired (update with: sgpt-free --colab <NEW_URL> <MODEL>) "
+                    f"or model '{model}' is not loaded on Colab (check: sgpt-free --models)."
+                ) from None
+        if exc.code in (502, 503, 504):
+            raise RuntimeError(
+                f"Colab/Ollama HTTP {exc.code}: Colab server or ngrok tunnel is unreachable. "
+                "Make sure your Colab cell is still running."
+            ) from None
+        raise RuntimeError(f"Colab/Ollama HTTP {exc.code}: {msg[:500]}") from None
+    except URLError as exc:
+        raise RuntimeError(
+            f"Colab/Ollama connection failed ({base_url}): {exc.reason}. "
+            "Check that your Colab cell is running and update URL with: sgpt-free --colab <URL> <MODEL>"
+        ) from None
+    except TimeoutError:
+        raise RuntimeError(f"Colab/Ollama request timed out after {TIMEOUT} seconds") from None
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            "Colab/Ollama returned non-JSON (possibly an ngrok warning or offline page). "
+            "Verify your Colab cell is running and URL is current."
+        ) from None
+
+    if not isinstance(result, dict) or not isinstance(result.get("choices"), list) or not result["choices"]:
+        err = result.get("error") if isinstance(result, dict) else None
+        if isinstance(err, dict) and err.get("message"):
+            raise RuntimeError(f"Colab/Ollama error: {str(err['message'])[:500]}")
+        raise RuntimeError("Colab/Ollama response contained no choices")
+    return _normalize_colab_message(result)
+
+
+def fetch_colab_models(cfg: dict) -> list[str]:
+    """Query live model IDs from the configured Colab/Ollama server."""
+    base_url = normalize_base_url(cfg.get("colab_url", ""))
+    if not base_url:
+        return []
+    api_key = (cfg.get("colab_api_key") or "").strip()
+    headers = _colab_headers(api_key)
+    for path in ("/v1/models", "/api/tags"):
+        try:
+            req = Request(f"{base_url}{path}", headers=headers, method="GET")
+            with urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if isinstance(data, dict):
+                if isinstance(data.get("data"), list):
+                    ids = [str(m.get("id", "")).strip() for m in data["data"] if isinstance(m, dict)]
+                    ids = [x for x in ids if x]
+                    if ids:
+                        return ids
+                if isinstance(data.get("models"), list):
+                    ids = [str(m.get("name", "")).strip() for m in data["models"] if isinstance(m, dict)]
+                    ids = [x for x in ids if x]
+                    if ids:
+                        return ids
+        except Exception:
+            continue
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Backend 2: OpenRouter direct + OpenCode CLI
+# ---------------------------------------------------------------------------
+
 def run_openrouter(model: str, req: dict) -> dict:
     """Call OpenRouter directly using the OpenCode-stored credential."""
     model_id = model[len("openrouter/"):] if model.startswith("openrouter/") else model
     payload: dict = {
         "model": model_id,
         "messages": req.get("messages", []),
-        # Get the full response first so shell-mode text can be sanitized safely.
         "stream": False,
     }
-    for key in _OPENROUTER_PARAMETERS:
+    for key in _OPENAI_PARAMETERS:
         if key in req and req[key] is not None:
             payload[key] = req[key]
-    # OpenRouter prefers tool calling through tools/tool_choice; retain legacy
-    # function calling only when that is what the client supplied.
 
     headers = {
         "Authorization": f"Bearer {_openrouter_api_key()}",
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "X-Title": "ShellGPT OpenRouter adapter",
+        "X-Title": "ShellGPT Local Adapter",
     }
     referer = os.getenv("OPENROUTER_HTTP_REFERER")
     if referer:
@@ -670,15 +990,7 @@ def run_openrouter(model: str, req: dict) -> dict:
             with urlopen(request, timeout=TIMEOUT) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            try:
-                details = json.loads(exc.read().decode("utf-8", errors="replace"))
-                error = details.get("error", {})
-                if isinstance(error, dict):
-                    message = str(error.get("message") or error.get("code") or "request rejected")
-                else:
-                    message = str(error or details.get("message") or "request rejected")
-            except Exception:
-                message = "request rejected"
+            message = _extract_http_error_message(exc)
             if exc.code in (402, 429) or _looks_like_limit(message):
                 raise RuntimeError(limit_message(model, message)) from None
             raise RuntimeError(f"OpenRouter HTTP {exc.code}: {message[:600]}") from None
@@ -689,8 +1001,6 @@ def run_openrouter(model: str, req: dict) -> dict:
         except json.JSONDecodeError:
             raise RuntimeError("OpenRouter returned invalid JSON") from None
     if not isinstance(result, dict) or not isinstance(result.get("choices"), list) or not result["choices"]:
-        # OpenRouter sometimes answers HTTP 200 with an error object instead
-        # of choices (for example a provider-side rate limit mid-request).
         err = result.get("error") if isinstance(result, dict) else None
         if isinstance(err, dict):
             msg = str(err.get("message") or err.get("code") or "")
@@ -706,24 +1016,25 @@ def run_openrouter(model: str, req: dict) -> dict:
 def run_opencode(model: str, prompt: str) -> str:
     with gate:
         try:
-            proc = subprocess.Popen(
-                [OPENCODE_BIN, "run", "-m", model, prompt],
-                cwd=SANDBOX,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-            )
+            popen_kwargs: dict = {
+                "cwd": SANDBOX,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+            }
+            if os.name != "nt":
+                popen_kwargs["start_new_session"] = True
+            proc = subprocess.Popen([OPENCODE_BIN, "run", "-m", model, prompt], **popen_kwargs)
         except OSError as exc:
             raise RuntimeError(f"Could not start OpenCode CLI: {exc}") from None
         try:
             stdout, stderr = proc.communicate(timeout=TIMEOUT)
         except subprocess.TimeoutExpired:
-            # Kill the WHOLE process group: a plain child kill can leave
-            # OpenCode's children alive, holding the request gate (and the
-            # provider session) hostage for every later request.
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                if os.name != "nt":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
             except (ProcessLookupError, PermissionError, OSError):
                 try:
                     proc.kill()
@@ -748,60 +1059,16 @@ def run_opencode(model: str, prompt: str) -> str:
 
 
 def _fallback_response(model: str, messages: list[dict], req: dict | None = None) -> dict:
-    """OpenCode CLI fallback for non-OpenRouter models.
-
-    Text models behind `opencode run` cannot emit native tool calls, so
-    when the client sent tool specs this uses a JSON shim: the functions
-    are listed in the prompt, a JSON function-call reply is translated
-    into a real OpenAI tool_calls response, and ShellGPT executes the
-    local function and sends the result back for a final answer.
-    OpenRouter models don't need this — they get native tool calling.
-    """
+    """OpenCode CLI fallback for non-OpenRouter models (with JSON tool-call shim)."""
     tools = extract_tools(req or {})
     prompt = flatten_messages(messages)
     if tools:
-        brief = "\n".join(
-            f"- {t['name']}: {t['description']} "
-            f"Parameters (JSON schema): {json.dumps(t['parameters'])}"
-            for t in tools
-        )
-        prompt += (
-            "\n\nFunctions you may call (at most one per reply), provided "
-            "by the person's own terminal program:\n" + brief + "\n"
-            "To call one, reply with ONLY this JSON object and nothing "
-            "else:\n"
-            '{"tool_call": {"name": "<function name>", '
-            '"arguments": {<arguments>}}}\n'
-            "If no function is needed, answer in plain text as usual."
-        )
+        prompt += _tool_shim_instruction(tools)
     text = run_opencode(model, prompt)
     if tools:
         parsed = parse_tool_call(text, {t["name"] for t in tools})
         if parsed is not None:
-            name, args = parsed
-            return {
-                "id": "chatcmpl-" + uuid.uuid4().hex[:24],
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": "call_" + uuid.uuid4().hex[:24],
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": json.dumps(args),
-                            },
-                        }],
-                    },
-                    "finish_reason": "tool_calls",
-                }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            }
+            return _make_tool_call_response(model, parsed[0], parsed[1])
     return {
         "id": "chatcmpl-" + uuid.uuid4().hex[:24],
         "object": "chat.completion",
@@ -844,15 +1111,34 @@ class Handler(BaseHTTPRequestHandler):
             print("[adapter] client disconnected before JSON response finished", flush=True)
 
     def do_GET(self):
+        cfg = load_runtime_config()
         if self.path in ("/health", "/v1/health"):
-            return self._send_json(200, {"status": "ok", "default_model": DEFAULT_MODEL or None})
+            return self._send_json(200, {
+                "status": "ok",
+                "backend": cfg.get("backend", "opencode"),
+                "colab_url": normalize_base_url(cfg.get("colab_url", "")) or None,
+                "default_model": (
+                    cfg.get("colab_model") if cfg.get("backend") == "colab" else DEFAULT_MODEL
+                ) or None,
+            })
         if self.path == "/v1/models":
-            # Known free ids, for discovery only — NOT a default. When no
-            # adapter default is set, the list is just FREE_MODELS and
-            # /health reports default_model: null.
+            if cfg.get("backend") == "colab" and cfg.get("colab_url"):
+                live = fetch_colab_models(cfg)
+                if not live and cfg.get("colab_model"):
+                    live = [cfg["colab_model"]]
+                data = [
+                    {"id": m, "object": "model", "created": int(time.time()), "owned_by": "colab-ollama"}
+                    for m in live
+                ]
+                return self._send_json(200, {"object": "list", "data": data})
             models = list(dict.fromkeys([m for m in [DEFAULT_MODEL, *FREE_MODELS] if m]))
             data = [
-                {"id": m, "object": "model", "created": int(time.time()), "owned_by": "openrouter" if m.startswith("openrouter/") else "opencode"}
+                {
+                    "id": m,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "openrouter" if m.startswith("openrouter/") else "opencode",
+                }
                 for m in models
             ]
             return self._send_json(200, {"object": "list", "data": data})
@@ -862,10 +1148,11 @@ class Handler(BaseHTTPRequestHandler):
         choice = response["choices"][0]
         message = choice.get("message") or {}
         cid = response.get("id") or ("chatcmpl-" + uuid.uuid4().hex[:24])
+        self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.end_headers()
 
         def sse(payload: dict):
@@ -878,8 +1165,6 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(content, str) and content:
                 for i in range(0, len(content), 400):
                     sse(chunk(cid, model, {"content": content[i:i + 400]}))
-            # Preserve modern tool calls (single complete delta per call) and
-            # deprecated function_call responses for ShellGPT's OpenAI client.
             tool_calls = message.get("tool_calls")
             if isinstance(tool_calls, list):
                 for index, tool in enumerate(tool_calls):
@@ -893,6 +1178,116 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             print("[adapter] streaming client disconnected; response stopped", flush=True)
+
+    def _proxy_colab_stream(self, model: str, req: dict, cfg: dict) -> bool:
+        """Stream tokens live from Colab/Ollama for chat mode so output appears immediately."""
+        base_url = normalize_base_url(cfg.get("colab_url", ""))
+        if not base_url:
+            raise RuntimeError(
+                "Colab backend is active, but no Colab URL is set. "
+                "Run: sgpt-free --colab <NGROK_URL> <MODEL>"
+            )
+        endpoint = f"{base_url}/v1/chat/completions"
+        api_key = (cfg.get("colab_api_key") or "").strip()
+        payload: dict = {
+            "model": model,
+            "messages": req.get("messages", []),
+            "stream": True,
+        }
+        for key in _OPENAI_PARAMETERS:
+            if key in req and req[key] is not None:
+                payload[key] = req[key]
+        if os.getenv("SGPT_COLAB_THINK", "").strip().lower() != "true" and "reasoning_effort" not in payload:
+            payload["reasoning_effort"] = "none"
+
+        def _open_stream(body_dict: dict):
+            data = json.dumps(body_dict).encode("utf-8")
+            request = Request(endpoint, data=data, headers=_colab_headers(api_key), method="POST")
+            return urlopen(request, timeout=TIMEOUT)
+
+        try:
+            upstream = _open_stream(payload)
+        except HTTPError as exc:
+            msg = _extract_http_error_message(exc)
+            if exc.code == 400 and "reasoning_effort" in payload and "reasoning" in msg.lower():
+                payload.pop("reasoning_effort", None)
+                try:
+                    upstream = _open_stream(payload)
+                except HTTPError as exc2:
+                    msg2 = _extract_http_error_message(exc2)
+                    raise RuntimeError(f"Colab/Ollama HTTP {exc2.code}: {msg2[:500]}") from None
+            else:
+                raise RuntimeError(f"Colab/Ollama HTTP {exc.code}: {msg[:500]}") from None
+        except URLError as exc:
+            raise RuntimeError(
+                f"Colab/Ollama connection failed ({base_url}): {exc.reason}. "
+                "Make sure your Colab cell is still running."
+            ) from None
+        except TimeoutError:
+            raise RuntimeError(f"Colab/Ollama request timed out after {TIMEOUT} seconds") from None
+
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        in_think = False
+        sent_content = False
+        reasoning_buf: list[str] = []
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        try:
+            with upstream:
+                for raw_line in upstream:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    if line == "data: [DONE]":
+                        if not sent_content and reasoning_buf:
+                            fallback_text = "".join(reasoning_buf).strip()
+                            if fallback_text:
+                                self.wfile.write(
+                                    f"data: {json.dumps(chunk(cid, model, {'content': fallback_text}), ensure_ascii=False)}\n\n".encode("utf-8")
+                                )
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                        break
+                    if not line.startswith("data:"):
+                        continue
+                    body = line[5:].strip()
+                    try:
+                        evt = json.loads(body)
+                    except Exception:
+                        continue
+                    if evt.get("id"):
+                        cid = evt["id"]
+                    choices = evt.get("choices") or []
+                    if choices:
+                        delta = choices[0].get("delta") or {}
+                        rtxt = delta.get("reasoning_content") or delta.get("reasoning")
+                        if isinstance(rtxt, str) and rtxt:
+                            reasoning_buf.append(rtxt)
+                        text = delta.get("content")
+                        if isinstance(text, str) and text:
+                            if "<think>" in text:
+                                in_think = True
+                                text = text.split("<think>", 1)[0]
+                            if in_think:
+                                if "</think>" in text:
+                                    text = text.split("</think>", 1)[1]
+                                    in_think = False
+                                else:
+                                    text = ""
+                            if text:
+                                sent_content = True
+                            delta["content"] = text
+                            choices[0]["delta"] = delta
+                    self.wfile.write(f"data: {json.dumps(evt, ensure_ascii=False)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            print("[adapter] streaming client disconnected; stopped Colab stream", flush=True)
+        return True
 
     def do_POST(self):
         if self.path != "/v1/chat/completions":
@@ -909,46 +1304,37 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(messages, list):
             return self._send_json(400, {"error": {"message": "messages must be an array"}})
         mode = output_mode(messages)
+        cfg = load_runtime_config()
         try:
-            # Inside the try so an unset/placeholder model reaches sgpt
-            # as a clear 502 message instead of a dropped connection.
-            model = backend_model(req.get("model"))
-            if model.startswith("openrouter/"):
+            route, model = resolve_route(req.get("model"), cfg)
+            if route == "colab" and bool(req.get("stream")) and mode == "chat" and not extract_tools(req):
+                self._proxy_colab_stream(model, req, cfg)
+                return
+            if route == "colab":
+                response = run_colab(model, req, cfg)
+            elif model.startswith("openrouter/"):
                 _key, _src = _find_openrouter_key()
                 if _key:
                     response = run_openrouter(model, req)
                 else:
-                    # No readable OpenRouter credential (e.g. the key is
-                    # held in a store this adapter cannot read). Do NOT
-                    # hard-fail: the OpenCode CLI route provably works on
-                    # machines where OpenCode itself can reach the model
-                    # (that is how the v2 setup ran). Log it once, plainly.
                     global _OR_FALLBACK_NOTED
                     if not _OR_FALLBACK_NOTED:
                         _OR_FALLBACK_NOTED = True
                         print(
-                            "[adapter] No readable OpenRouter credential found "
-                            "(checked env, OpenCode auth.json, OpenCode config, "
-                            "credential database). Serving openrouter/* via the "
-                            "OpenCode CLI route instead — same model, slower, "
-                            "and sampling/tool calls use the fallback behavior. "
-                            "To use the direct route, connect OpenRouter with "
-                            "an API key in OpenCode (/connect) or set "
-                            "OPENROUTER_API_KEY for the adapter.",
+                            "[adapter] No readable OpenRouter credential found. "
+                            "Serving openrouter/* via OpenCode CLI instead.",
                             flush=True,
                         )
                     response = _fallback_response(model, messages, req)
             else:
                 response = _fallback_response(model, messages, req)
+
             choices = response.get("choices") or []
             if not choices:
                 raise RuntimeError("Model response contained no choices")
             choice = choices[0]
             message = choice.get("message") or {}
             if isinstance(message.get("content"), str) and message["content"].strip():
-                # Strip leaked agent scaffolding FIRST (every mode, both
-                # routes): a stray tag line must never reach sgpt, let
-                # alone be executed as a shell command.
                 message["content"] = strip_scaffolding(message["content"], mode)
                 if mode == "shell":
                     message["content"] = sanitize_shell_output(message["content"])
@@ -960,17 +1346,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if bool(req.get("stream")):
             return self._stream_response(response, model)
-        # OpenRouter's response already matches the OpenAI response structure;
-        # fallback response is normalized to the same shape.
         return self._send_json(200, response)
 
 
 if __name__ == "__main__":
+    cfg = load_runtime_config()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(
-        f"sgpt adapter by UNIT-61398 on http://127.0.0.1:{PORT}/v1 "
-        f"(default model: {DEFAULT_MODEL or 'none configured - set DEFAULT_MODEL in .sgptrc or pass --model'}; OpenRouter direct for openrouter/*; "
-        f"OpenCode CLI fallback for other models; sandbox: {SANDBOX})",
+        f"sgpt-free adapter by UNIT-61398 on http://127.0.0.1:{PORT}/v1 "
+        f"(backend: {cfg.get('backend')}; colab_url: {cfg.get('colab_url') or 'not set'}; "
+        f"config: {CONFIG_PATH}; sandbox: {SANDBOX})",
         flush=True,
     )
     server.serve_forever()

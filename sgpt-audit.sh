@@ -55,6 +55,21 @@ printf 'Audit logs: %s\n\n' "$AUDIT_DIR"
 if ! command -v sgpt-free >/dev/null 2>&1 || ! command -v sgpt >/dev/null 2>&1; then
   fail 'sgpt-free / sgpt executable'; echo 'Install the package first (see README).'; exit 1
 fi
+if command -v sgpt-f >/dev/null 2>&1; then
+  pass 'Short alias sgpt-f installed'
+else
+  fail 'Short alias sgpt-f missing (re-run ./install.sh)'
+fi
+if sgpt-f --status >"$AUDIT_DIR/status.log" 2>&1; then
+  pass 'Local command: sgpt-f --status'
+else
+  fail 'Local command: sgpt-f --status'
+fi
+if sgpt-f --h >"$AUDIT_DIR/help-short.log" 2>&1 && grep -Fq -- '--colab' "$AUDIT_DIR/help-short.log"; then
+  pass 'Local command: sgpt-f --h (lists local + original sgpt options)'
+else
+  fail 'Local command: sgpt-f --h'
+fi
 if [ ! -f "$ADAPTER" ]; then fail "Adapter not found: $ADAPTER"; exit 1; fi
 if [ -z "$MODEL" ]; then fail 'DEFAULT_MODEL not set in .sgptrc'; exit 1; fi
 if [ "$MODEL" = "SET_YOUR_MODEL_HERE" ]; then
@@ -190,12 +205,56 @@ probe_re() {
 }
 
 printf '\n%s\n' '--- Live model-backed modes (may take time; free-tier limits apply) ---'
+# Pre-flight check: if Colab backend is active, make sure the ngrok URL is reachable
+# before running live probes (avoids waiting 240s on PTY/REPL timeouts when Colab is offline).
+if [ -f "$HOME/.config/shell_gpt/sgpt-free.json" ]; then
+  COLAB_CHECK="$(python3 - "$HOME/.config/shell_gpt/sgpt-free.json" <<'PY'
+import json, sys
+from urllib.request import Request, urlopen
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+if cfg.get("backend") == "colab":
+    url = (cfg.get("colab_url") or "").rstrip("/")
+    if not url:
+        print("NO_URL")
+    else:
+        try:
+            req = Request(f"{url}/v1/models", headers={"ngrok-skip-browser-warning": "true"})
+            with urlopen(req, timeout=10) as r:
+                print("OK" if r.status == 200 else f"HTTP_{r.status}")
+        except Exception as e:
+            print(f"OFFLINE:{e}")
+else:
+    print("SKIP")
+PY
+)"
+  case "$COLAB_CHECK" in
+    OK|SKIP) ;;
+    *)
+      fail "Colab backend is unreachable ($COLAB_CHECK)"
+      echo "  Your Colab cell stopped or ngrok URL changed."
+      echo "  Start Colab, update with:  sgpt-f --colab <NEW_URL> <MODEL>"
+      echo "  (Or switch to OpenCode:    sgpt-f --opencode opencode/beam-free)"
+      printf '\n========================================\nRESULT: %d PASS | %d FAIL | %d SKIP\n========================================\n' "$PASS" "$FAIL" "$SKIP"
+      exit 1
+      ;;
+  esac
+fi
+
 probe 'Normal chat response' 'SGPT_CHAT_OK' "$AUDIT_DIR/chat.log" \
   sgpt-free --no-cache --model "$MODEL" 'Reply with exactly this token and nothing else: SGPT_CHAT_OK'
 probe 'Code generation (-c)' 'SGPT_CODE_OK' "$AUDIT_DIR/code.log" \
   sgpt-free --no-cache --model "$MODEL" -c 'Return only Python code that prints exactly SGPT_CODE_OK'
 probe 'Describe shell (-d)' 'SGPT_DESCRIBE_OK' "$AUDIT_DIR/describe.log" \
   sgpt-free --no-cache --model "$MODEL" -d "echo SGPT_DESCRIBE_OK"
+
+# Stdin piping check
+timeout 150 sh -c "printf 'SGPT_PIPE_OK\n' | sgpt-free --no-cache --model \"$MODEL\" 'Repeat the exact token from stdin and nothing else.'" >"$AUDIT_DIR/pipe.log" 2>&1
+if [ $? -eq 0 ] && grep -Fq 'SGPT_PIPE_OK' "$AUDIT_DIR/pipe.log"; then
+  pass 'Stdin piping (echo ... | sgpt-free)'
+else
+  fail "Stdin piping (log=$AUDIT_DIR/pipe.log)"
+  tail -n 8 "$AUDIT_DIR/pipe.log" | sed 's/[[:cntrl:]]//g'
+fi
 
 CHAT_ID="audit$TS"
 PROBE_TIMEOUT=240

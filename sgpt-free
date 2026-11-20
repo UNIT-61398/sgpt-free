@@ -1,20 +1,577 @@
-#!/bin/sh
-# sgpt-free — one command for sgpt on OpenCode free models.
-# Starts the local adapter if it is not running, then runs sgpt.
-# Adapter + sgpt must be installed first (see install-kali.sh).
-DIR="$HOME/.local/share/sgpt-opencode"
-export NO_PROXY="localhost,127.0.0.1"
-export no_proxy="localhost,127.0.0.1"
+#!/usr/bin/env python3
+"""sgpt-free (alias: sgpt-f) — ShellGPT launcher & local backend manager.
 
-if ! curl -s -m 2 http://127.0.0.1:8642/health >/dev/null 2>&1; then
-  echo "[sgpt-free] starting adapter by UNIT-61398..." >&2
-  nohup python3 "$DIR/adapter.py" >"$DIR/adapter.log" 2>&1 &
-  i=0
-  while [ $i -lt 20 ]; do
-    curl -s -m 2 http://127.0.0.1:8642/health >/dev/null 2>&1 && break
-    i=$((i + 1))
-    sleep 0.5
-  done
-fi
+Supports two free backends transparently behind the local adapter:
+  1. Google Colab + Ollama (ngrok URL)  -> `sgpt-free --colab <URL> [MODEL]`
+  2. OpenCode / OpenRouter              -> `sgpt-free --opencode [MODEL]`
 
-exec sgpt "$@"
+Any other flags/arguments are passed directly to the original `sgpt` binary,
+so every ShellGPT feature (-s, -c, -d, --chat, --repl, --role, --functions,
+stdin piping, etc.) works identically.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+PORT = int(os.getenv("SGPT_OC_PORT", "8642"))
+ADAPTER_DIR = Path(os.getenv("SGPT_FREE_DIR", str(Path.home() / ".local" / "share" / "sgpt-opencode")))
+ADAPTER_PY = ADAPTER_DIR / "adapter.py"
+ADAPTER_LOG = ADAPTER_DIR / "adapter.log"
+AUDIT_SH = ADAPTER_DIR / "sgpt-audit.sh"
+CFG_DIR = Path(os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "shell_gpt"
+SGPTRC = CFG_DIR / ".sgptrc"
+FREE_CFG = Path(os.getenv("SGPT_FREE_CONFIG", str(CFG_DIR / "sgpt-free.json")))
+HEALTH_URL = f"http://127.0.0.1:{PORT}/health"
+
+KNOWN_OPENCODE_FREE = [
+    "opencode/beam-free",
+    "opencode/big-pickle",
+    "opencode/deepseek-v4.1-flash-free",
+    "opencode/glm-5.3-flash-free",
+    "opencode/mimo-v2.6-flash-free",
+    "opencode/minimax-m3.1-flash-free",
+    "openrouter/recursive/flint-v1.0:free",
+]
+
+
+def prog_name() -> str:
+    name = os.path.basename(sys.argv[0] or "sgpt-free")
+    return name if name in ("sgpt-free", "sgpt-f") else "sgpt-free"
+
+
+def normalize_url(url: str) -> str:
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return ""
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    for suffix in ("/v1/chat/completions", "/v1/models", "/api/chat", "/api/tags", "/v1"):
+        if u.endswith(suffix):
+            u = u[: -len(suffix)].rstrip("/")
+    return u
+
+
+def load_free_cfg() -> dict:
+    cfg = {
+        "backend": "opencode",
+        "colab_url": "",
+        "colab_model": "",
+        "colab_api_key": "",
+        "opencode_model": "",
+    }
+    try:
+        if FREE_CFG.exists():
+            data = json.loads(FREE_CFG.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cfg.update({k: v for k, v in data.items() if v is not None})
+    except Exception:
+        pass
+    return cfg
+
+
+def save_free_cfg(cfg: dict) -> None:
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    FREE_CFG.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+
+def read_sgptrc() -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not SGPTRC.exists():
+        return values
+    for line in SGPTRC.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k, v = s.split("=", 1)
+            values[k.strip()] = v.strip()
+    return values
+
+
+def update_sgptrc(updates: dict[str, str]) -> None:
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    text = SGPTRC.read_text(encoding="utf-8", errors="replace") if SGPTRC.exists() else ""
+    base_defaults = {
+        "OPENAI_API_KEY": "dummy-local",
+        "API_BASE_URL": f"http://127.0.0.1:{PORT}/v1",
+        "USE_LITELLM": "false",
+        "REQUEST_TIMEOUT": "600",
+        "DISABLE_STREAMING": "false",
+    }
+    merged = {**base_defaults, **updates}
+    for key, val in merged.items():
+        pattern = rf"(?m)^{re.escape(key)}=.*$"
+        if re.search(pattern, text):
+            text = re.sub(pattern, lambda _m, k=key, v=val: f"{k}={v}", text)
+        else:
+            text = text.rstrip() + ("\n" if text.strip() else "") + f"{key}={val}\n"
+    if not re.search(r"(?m)^DEFAULT_MODEL=", text):
+        text = text.rstrip() + "\nDEFAULT_MODEL=SET_YOUR_MODEL_HERE\n"
+    SGPTRC.write_text(text.rstrip() + "\n", encoding="utf-8")
+
+
+def fetch_colab_models(url: str, api_key: str = "") -> list[str]:
+    base = normalize_url(url)
+    if not base:
+        return []
+    headers = {
+        "Accept": "application/json",
+        "ngrok-skip-browser-warning": "true",
+        "User-Agent": "sgpt-free/5.0",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    for path in ("/v1/models", "/api/tags"):
+        try:
+            req = Request(f"{base}{path}", headers=headers, method="GET")
+            with urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if isinstance(data, dict):
+                if isinstance(data.get("data"), list):
+                    ids = [str(m.get("id", "")).strip() for m in data["data"] if isinstance(m, dict)]
+                    ids = [x for x in ids if x]
+                    if ids:
+                        return ids
+                if isinstance(data.get("models"), list):
+                    ids = [str(m.get("name", "")).strip() for m in data["models"] if isinstance(m, dict)]
+                    ids = [x for x in ids if x]
+                    if ids:
+                        return ids
+        except Exception:
+            continue
+    return []
+
+
+def check_health() -> dict | None:
+    try:
+        with urlopen(HEALTH_URL, timeout=2) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def find_adapter_script() -> Path | None:
+    if ADAPTER_PY.exists():
+        return ADAPTER_PY
+    local = Path(__file__).resolve().parent / "adapter.py"
+    if local.exists():
+        return local
+    return None
+
+
+def stop_adapter() -> bool:
+    stopped = False
+    if os.name != "nt":
+        for cmd in (["pkill", "-f", "[a]dapter.py"], ["fuser", "-k", f"{PORT}/tcp"]):
+            try:
+                r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if r.returncode == 0:
+                    stopped = True
+            except OSError:
+                pass
+        time.sleep(0.5)
+    return stopped
+
+
+def ensure_adapter(quiet: bool = False) -> bool:
+    if check_health():
+        return True
+    script = find_adapter_script()
+    if not script:
+        print(f"[sgpt-free] ERROR: adapter.py not found in {ADAPTER_DIR}", file=sys.stderr)
+        return False
+    ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
+    if not quiet:
+        print("[sgpt-free] starting local adapter by UNIT-61398...", file=sys.stderr)
+    with open(ADAPTER_LOG, "a", encoding="utf-8") as logf:
+        popen_kwargs: dict = {
+            "stdout": logf,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+        }
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        subprocess.Popen([sys.executable, str(script)], **popen_kwargs)
+    for _ in range(25):
+        if check_health():
+            return True
+        time.sleep(0.3)
+    print(f"[sgpt-free] ERROR: adapter did not start. Check log: {ADAPTER_LOG}", file=sys.stderr)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Local Management Commands
+# ---------------------------------------------------------------------------
+
+def cmd_help() -> int:
+    p = prog_name()
+    print(f"""
+========================================================================
+  {p}  (alias: sgpt-free / sgpt-f) — Free ShellGPT on Any Linux
+========================================================================
+
+LOCAL SETUP & BACKEND COMMANDS (managed by {p}):
+  {p} --setup                   Interactive setup wizard (Colab or OpenCode)
+  {p} --colab <URL> [MODEL]     Switch to Google Colab / Ollama server (ngrok URL)
+  {p} --opencode [MODEL]        Switch to OpenCode / OpenRouter backend
+  {p} --set-model <MODEL>       Change default model without editing files
+  {p} --models                  List available models for the active backend
+  {p} --status                  Show active backend, model, URL & adapter health
+  {p} --functions-on            Enable ShellGPT function calling (--functions)
+  {p} --functions-off           Disable ShellGPT function calling
+  {p} --restart                 Restart the local adapter
+  {p} --stop                    Stop the local adapter
+  {p} --logs                    Show recent local adapter logs
+  {p} --test, --audit [MODEL]   Run full pre-flight test of ALL sgpt features
+  {p} --help, --h, -h           Show this complete help (local + original sgpt)
+
+QUICK EXAMPLES (all original ShellGPT features work on both backends):
+  {p} "explain DNS in 3 lines"              Normal chat
+  {p} -s "find large files over 100MB"      Generate & execute shell command [E/M/D/A]
+  {p} -d "tar -xzvf archive.tar.gz"         Describe a shell command
+  {p} -c "python port scanner"              Generate code only (no markdown)
+  {p} --chat dev "review this idea"         Persistent multi-turn chat
+  {p} --repl temp                           Interactive REPL session
+  {p} -s --repl temp                        Interactive shell-command REPL
+  {p} --model <MODEL> "prompt"              Override model for one command
+  cat error.log | {p} "why did this fail?"  Pipe stdin into prompt
+
+------------------------------------------------------------------------
+  ORIGINAL SHELLGPT (sgpt) OPTIONS & USAGE
+------------------------------------------------------------------------
+""".lstrip("\n"))
+
+    sgpt_bin = shutil.which("sgpt")
+    if sgpt_bin:
+        env = os.environ.copy()
+        env["NO_PROXY"] = "localhost,127.0.0.1"
+        env["no_proxy"] = "localhost,127.0.0.1"
+        r = subprocess.run([sgpt_bin, "--help"], env=env)
+        return r.returncode
+
+    print("""  Usage: sgpt [OPTIONS] [PROMPT]
+
+  Core Options:
+    --model TEXT                  Large language model to use
+    --temperature FLOAT           Randomness of generated output (0.0 - 2.0)
+    --top-p FLOAT                 Limits highest probable tokens (0.0 - 1.0)
+    --md / --no-md                Prettify markdown output
+    --editor                      Open $EDITOR to provide a prompt
+    --cache / --no-cache          Cache completion results
+    --version                     Show ShellGPT version
+
+  Assistance Options:
+    -s, --shell                   Generate and execute shell commands
+    --interaction / --no-interaction  Interactive [E/M/D/A] prompt for --shell
+    -d, --describe-shell          Describe a shell command
+    -c, --code                    Generate only code
+    --functions / --no-functions  Allow function calls
+
+  Chat Options:
+    --chat TEXT                   Follow conversation with id ("temp" for quick)
+    --repl TEXT                   Start an interactive REPL session
+    --show-chat TEXT              Show all messages from chat id
+    -lc, --list-chats             List all existing chat ids
+
+  Role Options:
+    --role TEXT                   System role for model
+    --create-role TEXT            Create a custom role
+    --show-role TEXT              Show a role
+    -lr, --list-roles             List all roles
+
+  (Install original sgpt with ./install.sh to run live queries.)""")
+    return 0
+
+
+def cmd_colab(args: list[str]) -> int:
+    if not args:
+        print(f"Usage: {prog_name()} --colab <NGROK_URL> [MODEL]", file=sys.stderr)
+        print(f"Example: {prog_name()} --colab https://xxxx.ngrok-free.app sgpt-ai", file=sys.stderr)
+        return 1
+
+    url = normalize_url(args[0])
+    model = args[1].strip() if len(args) > 1 else ""
+
+    print(f"[sgpt-free] Testing Colab/Ollama server at {url} ...")
+    live_models = fetch_colab_models(url)
+    if live_models:
+        print(f"[sgpt-free] Connected! Models on Colab: {', '.join(live_models)}")
+        if not model:
+            model = live_models[0]
+            print(f"[sgpt-free] Auto-selected model: {model}")
+    else:
+        print("[sgpt-free] Warning: could not fetch /v1/models right now (saving settings anyway).")
+        if not model:
+            prev = load_free_cfg().get("colab_model", "")
+            model = prev or "sgpt-ai"
+            print(f"[sgpt-free] Using model name: {model} (change anytime with --set-model)")
+
+    cfg = load_free_cfg()
+    cfg["backend"] = "colab"
+    cfg["colab_url"] = url
+    cfg["colab_model"] = model
+    save_free_cfg(cfg)
+    update_sgptrc({"DEFAULT_MODEL": model})
+    stop_adapter()
+    ensure_adapter(quiet=True)
+    print(f"\n[OK] Switched to Colab backend!")
+    print(f"     URL   : {url}")
+    print(f"     Model : {model}")
+    print(f"     Test  : {prog_name()} \"say hi in 3 words\"")
+    return 0
+
+
+def cmd_opencode(args: list[str]) -> int:
+    cfg = load_free_cfg()
+    model = args[0].strip() if args else (cfg.get("opencode_model") or "")
+    cfg["backend"] = "opencode"
+    if model:
+        cfg["opencode_model"] = model
+    save_free_cfg(cfg)
+    if model:
+        update_sgptrc({"DEFAULT_MODEL": model})
+    else:
+        rc = read_sgptrc()
+        cur = rc.get("DEFAULT_MODEL", "")
+        if not cur or cur == "SET_YOUR_MODEL_HERE" or cur == cfg.get("colab_model"):
+            update_sgptrc({"DEFAULT_MODEL": "SET_YOUR_MODEL_HERE"})
+            model = "SET_YOUR_MODEL_HERE"
+        else:
+            model = cur
+    ensure_adapter(quiet=True)
+    print("\n[OK] Switched to OpenCode / OpenRouter backend!")
+    print(f"     Model : {model}")
+    if model == "SET_YOUR_MODEL_HERE":
+        print(f"     Next  : {prog_name()} --models   (to see models)")
+        print(f"             {prog_name()} --set-model opencode/beam-free")
+    else:
+        print(f"     Test  : {prog_name()} \"say hi in 3 words\"")
+    return 0
+
+
+def cmd_set_model(args: list[str]) -> int:
+    if not args:
+        print(f"Usage: {prog_name()} --set-model <MODEL>", file=sys.stderr)
+        return 1
+    model = args[0].strip()
+    cfg = load_free_cfg()
+    if cfg.get("backend") == "colab":
+        cfg["colab_model"] = model
+    else:
+        cfg["opencode_model"] = model
+    save_free_cfg(cfg)
+    update_sgptrc({"DEFAULT_MODEL": model})
+    print(f"[OK] Default model set to: {model} (backend: {cfg.get('backend')})")
+    return 0
+
+
+def cmd_models() -> int:
+    cfg = load_free_cfg()
+    backend = cfg.get("backend", "opencode")
+    rc = read_sgptrc()
+    current = rc.get("DEFAULT_MODEL", "not set")
+    print(f"Active backend : {backend}")
+    print(f"Current model  : {current}\n")
+
+    if backend == "colab":
+        url = cfg.get("colab_url", "")
+        if not url:
+            print("No Colab URL configured. Run: sgpt-free --colab <NGROK_URL> [MODEL]")
+            return 1
+        models = fetch_colab_models(url, cfg.get("colab_api_key", ""))
+        if not models:
+            print(f"Could not reach {url}/v1/models (is your Colab cell running?).")
+            return 1
+        print(f"Models available on Colab ({url}):")
+        for m in models:
+            mark = "  <-- active" if m == current else ""
+            print(f"  - {m}{mark}")
+        print(f"\nSwitch with: {prog_name()} --set-model <MODEL>")
+        return 0
+
+    oc = shutil.which("opencode") or str(Path.home() / ".opencode" / "bin" / "opencode")
+    if os.path.exists(oc):
+        print("OpenCode CLI models ('opencode models'):")
+        subprocess.run([oc, "models"])
+        print()
+    print("Common free model IDs:")
+    for m in KNOWN_OPENCODE_FREE:
+        mark = "  <-- active" if m == current else ""
+        print(f"  - {m}{mark}")
+    print(f"\nSwitch with: {prog_name()} --set-model <provider/model-id>")
+    return 0
+
+
+def cmd_status() -> int:
+    cfg = load_free_cfg()
+    rc = read_sgptrc()
+    health = check_health()
+    backend = cfg.get("backend", "opencode")
+    print("========================================")
+    print("  sgpt-free / sgpt-f Status")
+    print("========================================")
+    print(f"  Backend        : {backend}")
+    print(f"  Default model  : {rc.get('DEFAULT_MODEL', '<not set>')}")
+    if backend == "colab":
+        print(f"  Colab URL      : {cfg.get('colab_url') or '<not set>'}")
+    print(f"  API Base URL   : {rc.get('API_BASE_URL', '<not set>')}")
+    print(f"  Functions      : {rc.get('OPENAI_USE_FUNCTIONS', 'false')}")
+    print(f"  Streaming      : {'OFF' if rc.get('DISABLE_STREAMING') == 'true' else 'ON'}")
+    print(f"  Adapter        : {'RUNNING (port ' + str(PORT) + ')' if health else 'STOPPED (auto-starts on next query)'}")
+    print(f"  Config file    : {FREE_CFG}")
+    print(f"  ShellGPT rc    : {SGPTRC}")
+    if backend == "colab" and cfg.get("colab_url"):
+        live = fetch_colab_models(cfg["colab_url"], cfg.get("colab_api_key", ""))
+        if live:
+            print(f"  Colab status   : ONLINE ({len(live)} model(s): {', '.join(live[:4])})")
+        else:
+            print("  Colab status   : UNREACHABLE (start your Colab cell or update URL)")
+    print("========================================")
+    return 0
+
+
+def cmd_setup() -> int:
+    p = prog_name()
+    print("========================================")
+    print("  sgpt-free Interactive Setup")
+    print("========================================")
+    print("  1) Google Colab + Ollama (ngrok URL — any model on free T4 GPU)")
+    print("  2) OpenCode / OpenRouter (built-in free models or connected providers)")
+    choice = input("\nChoose backend [1/2]: ").strip()
+
+    if choice == "1":
+        prev_url = load_free_cfg().get("colab_url", "")
+        prompt = f"Enter Colab ngrok URL [{prev_url}]: " if prev_url else "Enter Colab ngrok URL (e.g. https://xxxx.ngrok-free.app): "
+        url = input(prompt).strip() or prev_url
+        if not url:
+            print("Aborted: URL is required.")
+            return 1
+        url = normalize_url(url)
+        print(f"Checking {url} ...")
+        live = fetch_colab_models(url)
+        model = ""
+        if live:
+            print("\nAvailable models on Colab:")
+            for idx, m in enumerate(live, 1):
+                print(f"  {idx}) {m}")
+            sel = input(f"Pick a number or type model name [1 = {live[0]}]: ").strip()
+            if not sel:
+                model = live[0]
+            elif sel.isdigit() and 1 <= int(sel) <= len(live):
+                model = live[int(sel) - 1]
+            else:
+                model = sel
+        else:
+            model = input("Could not list models automatically. Type model name [sgpt-ai]: ").strip() or "sgpt-ai"
+        return cmd_colab([url, model])
+
+    if choice == "2":
+        print("\nPopular free OpenCode / OpenRouter models:")
+        for idx, m in enumerate(KNOWN_OPENCODE_FREE, 1):
+            print(f"  {idx}) {m}")
+        sel = input("Pick a number or type any provider/model-id: ").strip()
+        if sel.isdigit() and 1 <= int(sel) <= len(KNOWN_OPENCODE_FREE):
+            model = KNOWN_OPENCODE_FREE[int(sel) - 1]
+        else:
+            model = sel
+        return cmd_opencode([model] if model else [])
+
+    print(f"Invalid choice. Run '{p} --setup' again.")
+    return 1
+
+
+def cmd_functions(enabled: bool) -> int:
+    val = "true" if enabled else "false"
+    update_sgptrc({"OPENAI_USE_FUNCTIONS": val})
+    print(f"[OK] OPENAI_USE_FUNCTIONS={val} in {SGPTRC}")
+    if enabled:
+        print("     Tip: if you haven't installed ShellGPT's default functions yet, run:")
+        print(f"          {prog_name()} --install-functions")
+    return 0
+
+
+def cmd_logs() -> int:
+    if not ADAPTER_LOG.exists():
+        print(f"No log file yet at {ADAPTER_LOG}")
+        return 0
+    lines = ADAPTER_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines[-60:]:
+        print(line)
+    return 0
+
+
+def cmd_audit(args: list[str]) -> int:
+    script = AUDIT_SH if AUDIT_SH.exists() else (Path(__file__).resolve().parent / "sgpt-audit.sh")
+    if not script.exists():
+        print(f"Audit script not found at {script}", file=sys.stderr)
+        return 1
+    return subprocess.run(["bash", str(script), *args]).returncode
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args and sys.stdin.isatty():
+        return cmd_help()
+
+    first = args[0] if args else ""
+    if first in ("--help", "--h", "-h"):
+        return cmd_help()
+    if first == "--setup":
+        return cmd_setup()
+    if first == "--colab":
+        return cmd_colab(args[1:])
+    if first == "--opencode":
+        return cmd_opencode(args[1:])
+    if first == "--set-model":
+        return cmd_set_model(args[1:])
+    if first in ("--models", "--list-models"):
+        return cmd_models()
+    if first == "--status":
+        return cmd_status()
+    if first == "--functions-on":
+        return cmd_functions(True)
+    if first == "--functions-off":
+        return cmd_functions(False)
+    if first == "--stop":
+        stop_adapter()
+        print("[OK] Local adapter stopped.")
+        return 0
+    if first == "--restart":
+        stop_adapter()
+        return 0 if ensure_adapter(quiet=False) else 1
+    if first == "--logs":
+        return cmd_logs()
+    if first in ("--audit", "--test"):
+        return cmd_audit(args[1:])
+
+    # Pass-through to original ShellGPT (`sgpt`)
+    os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+    os.environ["no_proxy"] = "localhost,127.0.0.1"
+
+    if not ensure_adapter():
+        return 1
+
+    sgpt_bin = shutil.which("sgpt")
+    if not sgpt_bin:
+        print(
+            "[sgpt-free] ERROR: original 'sgpt' command not found in PATH.\n"
+            "Run ./install.sh or: pipx install shell-gpt",
+            file=sys.stderr,
+        )
+        return 1
+
+    os.execvp(sgpt_bin, ["sgpt", *args])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
